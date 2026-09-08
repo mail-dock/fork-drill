@@ -57,15 +57,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: setup
+        continue-on-error: true
         with: { python-version: '3.12' }
       - name: facts
-        run: echo "WLM|python|python.version=$(python -V | awk '{print $2}')"
+        run: |
+          echo "WLM|python|setup-python.outcome=${{ steps.setup.outcome }}"
+          echo "WLM|python|lsb_release.present=$(command -v lsb_release > /dev/null && echo yes || echo no)"
+          PY=$(command -v python3 || command -v python || echo absent)
+          echo "WLM|python|interpreter=$([ "$PY" = absent ] && echo absent || echo present)"
+          echo "WLM|python|python.version=$($PY -V 2>&1 | awk '{print $2}')"
       - name: test
         working-directory: workloads/python
         run: |
-          python -m unittest -q test_fib > /dev/null 2>&1
+          PY=$(command -v python3 || command -v python)
+          $PY -m unittest -q test_fib > /dev/null 2>&1
           echo "WLM|python|test.exit=$?"
-          echo "WLM|python|fib20=$(python fib.py)"
+          echo "WLM|python|fib20=$($PY fib.py)"
 
   rust:
     runs-on: ubuntu-latest
@@ -75,12 +83,24 @@ jobs:
         run: |
           echo "WLM|rust|cargo.present=$(command -v cargo > /dev/null && echo yes || echo no)"
           echo "WLM|rust|rustc.version=$(rustc --version 2>/dev/null | awk '{print $2}' || echo absent)"
+      - name: install a toolchain when the image has none
+        if: ${{ true }}
+        run: |
+          if command -v cargo > /dev/null; then
+            echo "WLM|rust|install.needed=no"
+          else
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0 > /dev/null 2>&1
+            echo "WLM|rust|install.needed=yes"
+            echo "WLM|rust|install.exit=$?"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - name: build and test
         working-directory: workloads/rust
         run: |
           cargo test --offline -q > /dev/null 2>&1
           echo "WLM|rust|test.exit=$?"
-          cargo run --offline -q 2>/dev/null | sed 's/^/WLM|rust|run=/'
+          echo "WLM|rust|run=$(cargo run --offline -q 2>/dev/null)"
+          echo "WLM|rust|rustc.after=$(rustc --version 2>/dev/null | awk '{print $2}' || echo absent)"
 
   docker:
     runs-on: ubuntu-latest
@@ -118,16 +138,27 @@ jobs:
       - name: facts
         run: |
           echo "WLM|postgres|psql.present=$(command -v psql > /dev/null && echo yes || echo no)"
-      - name: query the service
+      - name: reach the service without a client
+        # A bare TCP connect, because the first version of this asked psql and
+        # then read `$?` *after a for-loop* — which is the loop's exit, not
+        # psql's, so it printed `connect.exit=0` on a platform with no psql at
+        # all. The service is the thing under test; the client is not.
+        run: |
+          if timeout 30 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null; do sleep 1; done'; then
+            echo "WLM|postgres|tcp.open=yes"
+          else
+            echo "WLM|postgres|tcp.open=no"
+          fi
+      - name: query it, if a client exists
         env: { PGPASSWORD: wlm }
         run: |
-          for i in $(seq 1 30); do
-            psql -h 127.0.0.1 -U wlm -d wlm -c 'select 1' > /dev/null 2>&1 && break
-            sleep 2
-          done
-          echo "WLM|postgres|connect.exit=$?"
-          echo "WLM|postgres|server.version=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'show server_version' 2>/dev/null || echo unreachable)"
-          echo "WLM|postgres|select=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'select 40 + 2' 2>/dev/null || echo unreachable)"
+          if command -v psql > /dev/null; then
+            echo "WLM|postgres|server.version=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'show server_version' 2>&1 | head -1)"
+            echo "WLM|postgres|select=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'select 40 + 2' 2>&1 | head -1)"
+          else
+            echo "WLM|postgres|server.version=no-client"
+            echo "WLM|postgres|select=no-client"
+          fi
 
   # Facts that are about the *environment* rather than a language, gathered once.
   # These are the ones a workflow can observe and therefore depend on.
