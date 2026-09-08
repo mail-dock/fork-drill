@@ -1,0 +1,155 @@
+# TASK-0057 — a representative-workload matrix, run on **both** platforms at the
+# same commit and diffed.
+#
+# This repository is the only place that can host it: `mail-dock` is the
+# sanctioned test tenant, GitHub Actions is enabled here (it is disabled
+# org-wide on `Apex-Actions`), and Apex's App is installed on it too. So one
+# push produces two runs of the same commit, one on each platform.
+#
+# Every job prints facts on lines beginning `WLM|`, and nothing else is
+# compared. A free-text log diff is dominated by timestamps, ids and paths that
+# are *supposed* to differ; the point is to compare the answers a workflow can
+# actually observe.
+name: workload-matrix
+
+on:
+  push:
+    branches: [workload-matrix]
+  workflow_dispatch:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: facts
+        run: |
+          echo "WLM|node|node.version=$(node -v)"
+          echo "WLM|node|npm.version=$(npm -v)"
+      - name: build and test
+        working-directory: workloads/node
+        run: |
+          node --test 2>&1 | tail -5
+          echo "WLM|node|test.exit=$?"
+          echo "WLM|node|fib20=$(node -e 'import("./index.js").then(m=>console.log(m.fib(20)))')"
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.23' }
+      - name: facts
+        run: echo "WLM|go|go.version=$(go version | awk '{print $3}')"
+      - name: build and test
+        working-directory: workloads/go
+        run: |
+          go test ./... > /dev/null 2>&1
+          echo "WLM|go|test.exit=$?"
+          go build -trimpath -o /tmp/wlm-go .
+          echo "WLM|go|binary.sha256=$(sha256sum /tmp/wlm-go | cut -c1-16)"
+          echo "WLM|go|run=$(/tmp/wlm-go)"
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: facts
+        run: echo "WLM|python|python.version=$(python -V | awk '{print $2}')"
+      - name: test
+        working-directory: workloads/python
+        run: |
+          python -m unittest -q test_fib > /dev/null 2>&1
+          echo "WLM|python|test.exit=$?"
+          echo "WLM|python|fib20=$(python fib.py)"
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: facts
+        run: |
+          echo "WLM|rust|cargo.present=$(command -v cargo > /dev/null && echo yes || echo no)"
+          echo "WLM|rust|rustc.version=$(rustc --version 2>/dev/null | awk '{print $2}' || echo absent)"
+      - name: build and test
+        working-directory: workloads/rust
+        run: |
+          cargo test --offline -q > /dev/null 2>&1
+          echo "WLM|rust|test.exit=$?"
+          cargo run --offline -q 2>/dev/null | sed 's/^/WLM|rust|run=/'
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: facts
+        run: |
+          echo "WLM|docker|docker.present=$(command -v docker > /dev/null && echo yes || echo no)"
+          echo "WLM|docker|server.version=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unreachable)"
+      - name: build
+        working-directory: workloads/docker
+        run: |
+          docker build -q -t wlm:local . > /tmp/id 2>/tmp/err
+          echo "WLM|docker|build.exit=$?"
+          echo "WLM|docker|image.id=$(cut -c1-23 /tmp/id 2>/dev/null || echo none)"
+          echo "WLM|docker|run=$(docker run --rm wlm:local 2>/dev/null || echo failed)"
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: wlm
+          POSTGRES_USER: wlm
+          POSTGRES_DB: wlm
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U wlm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: facts
+        run: |
+          echo "WLM|postgres|psql.present=$(command -v psql > /dev/null && echo yes || echo no)"
+      - name: query the service
+        env: { PGPASSWORD: wlm }
+        run: |
+          for i in $(seq 1 30); do
+            psql -h 127.0.0.1 -U wlm -d wlm -c 'select 1' > /dev/null 2>&1 && break
+            sleep 2
+          done
+          echo "WLM|postgres|connect.exit=$?"
+          echo "WLM|postgres|server.version=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'show server_version' 2>/dev/null || echo unreachable)"
+          echo "WLM|postgres|select=$(psql -h 127.0.0.1 -U wlm -d wlm -tAc 'select 40 + 2' 2>/dev/null || echo unreachable)"
+
+  # Facts that are about the *environment* rather than a language, gathered once.
+  # These are the ones a workflow can observe and therefore depend on.
+  environment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: facts
+        run: |
+          echo "WLM|env|os=$(. /etc/os-release && echo "$ID $VERSION_ID")"
+          echo "WLM|env|arch=$(uname -m)"
+          echo "WLM|env|nproc=$(nproc)"
+          echo "WLM|env|user=$(id -un):$(id -u)"
+          echo "WLM|env|home.is.root=$([ "$HOME" = "/root" ] && echo yes || echo no)"
+          echo "WLM|env|cwd.is.workspace=$([ "$PWD" = "$GITHUB_WORKSPACE" ] && echo yes || echo no)"
+          echo "WLM|env|checkout.has.git=$([ -d .git ] && echo yes || echo no)"
+          echo "WLM|env|runner.os=$RUNNER_OS"
+          echo "WLM|env|runner.arch=$RUNNER_ARCH"
+          echo "WLM|env|ci=$CI"
+          echo "WLM|env|github.event_name=${{ github.event_name }}"
+          echo "WLM|env|github.ref=${{ github.ref }}"
+          echo "WLM|env|toolcache.present=$([ -n "$RUNNER_TOOL_CACHE" ] && [ -d "$RUNNER_TOOL_CACHE" ] && echo yes || echo no)"
+          echo "WLM|env|dev.shm.size=$(df -k /dev/shm 2>/dev/null | awk 'NR==2{print $2}' || echo absent)"
+          echo "WLM|env|sudo.present=$(command -v sudo > /dev/null && echo yes || echo no)"
+          echo "WLM|env|git.version=$(git --version | awk '{print $3}')"

@@ -17,3 +17,14 @@ untrusted. A pull request opened here from a fork must:
 `push` run on a branch of this repository is the control: it must see the secret as present.
 
 Nothing here prints a secret's value. Presence is reported as a word, never as bytes.
+
+## `workload-matrix` — TASK-0057
+
+A second drill lives here, on the `workload-matrix` branch. This repository is the only place it can
+run: `mail-dock` is the sanctioned test tenant, **GitHub Actions is enabled here** — it is disabled
+org-wide on `Apex-Actions` — and Apex's App is installed on it too. One push therefore produces two
+runs of the same commit, one on each platform, which is what makes the outputs comparable at all.
+
+Six workloads: Node, Go, Python, Rust, a Docker build and a Postgres service, plus a job that reports
+the environment facts a workflow can actually observe. Every comparable line begins `WLM|`, because a
+free-text log diff is dominated by timestamps, ids and paths that are *supposed* to differ.
